@@ -5,6 +5,8 @@ import pandas as pd
 import streamlit as st
 
 from config import COUNTRY_ORDER, NARA_JOURNALS, REGION_ORDER, UK_HEIS
+from auth import logout, require_login
+
 from services import (
     apply_geography_filters,
     build_member_summary,
@@ -18,6 +20,8 @@ st.set_page_config(
     page_icon="🔎",
     layout="wide",
 )
+
+require_login()
 
 
 def get_secret(name):
@@ -75,6 +79,11 @@ st.caption(
 )
 
 with st.sidebar:
+    st.header("NARA-CAMHR")
+    st.caption("Signed in as NARA-CAMHR@hull.ac.uk")
+    if st.button("Log out", use_container_width=True):
+        logout()
+    st.divider()
     st.header("Search")
 
     database = st.radio("Database", ["PubMed", "OpenAlex"], horizontal=True)
@@ -117,27 +126,11 @@ with st.sidebar:
     hei_options = available_heis(selected_countries, selected_regions)
     selected_heis = st.multiselect("HEIs", hei_options, default=[])
 
-    if database == "PubMed":
-        retrieval_mode = st.radio(
-            "Publication retrieval",
-            ["All matching publications", "Limit publications"],
-            help="All matching automatically splits large PubMed searches into smaller date windows."
-        )
-
-        if retrieval_mode == "All matching publications":
-            max_publications = None
-        else:
-            max_publications = st.select_slider(
-                "Maximum publications to retrieve",
-                options=[100, 250, 500, 1000, 2000, 5000, 10000, 20000, 50000],
-                value=10000,
-            )
-    else:
-        max_publications = st.select_slider(
-            "Maximum publications to retrieve",
-            options=[100, 250, 500, 1000, 2000, 5000, 10000, 20000],
-            value=2000,
-        )
+    max_publications = st.select_slider(
+        "Maximum publications to retrieve",
+        options=[100, 250, 500, 1000, 2000, 5000, 10000],
+        value=2000,
+    )
 
     st.subheader("API access")
     if database == "PubMed":
@@ -243,55 +236,19 @@ if member_df.empty and detailed_df.empty:
     st.stop()
 
 
-if database_used == "PubMed":
-    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
-    metric1.metric("Potential members", f"{len(member_df):,}")
-    metric2.metric("PubMed hits", f"{meta.get('total_publication_hits', 0):,}")
-    metric3.metric("Retrieved", f"{meta.get('retrieved_publications', 0):,}")
-    metric4.metric("Matched publications", f"{detailed_df['Publication ID'].nunique():,}" if not detailed_df.empty else "0")
-    metric5.metric("UK HEIs", f"{member_df['University'].nunique():,}" if not member_df.empty else "0")
-else:
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("Potential members", f"{len(member_df):,}")
-    metric2.metric("UK HEIs", f"{member_df['University'].nunique():,}" if not member_df.empty else "0")
-    metric3.metric("Matched publications", f"{detailed_df['Publication ID'].nunique():,}" if not detailed_df.empty else "0")
-    metric4.metric("Regions", f"{member_df['Region'].nunique():,}" if not member_df.empty else "0")
+metric1, metric2, metric3, metric4 = st.columns(4)
+metric1.metric("Potential members", f"{len(member_df):,}")
+metric2.metric("UK HEIs", f"{member_df['University'].nunique():,}" if not member_df.empty else "0")
+metric3.metric("Publications", f"{detailed_df['Publication ID'].nunique():,}" if not detailed_df.empty else "0")
+metric4.metric("Regions", f"{member_df['Region'].nunique():,}" if not member_df.empty else "0")
 
 if meta:
     total_hits = meta.get("total_publication_hits", 0)
     retrieved = meta.get("retrieved_publications", 0)
-
-    if database_used == "PubMed":
-        matched_before_filters = meta.get("publications_with_uk_hei_authors", 0)
-        limit = meta.get("requested_publication_limit")
-        complete = meta.get("complete_retrieval", False)
-        truncations = meta.get("single_day_truncations", 0)
-
-        if complete:
-            st.success(
-                f"PubMed found {total_hits:,} matching publications and all {retrieved:,} were retrieved. "
-                f"{matched_before_filters:,} of them had at least one author matched to the UK HEI table before your region/HEI filters."
-            )
-        elif limit and retrieved >= limit:
-            st.warning(
-                f"PubMed found {total_hits:,} matching publications. This run retrieved {retrieved:,} because "
-                f"the selected publication limit was {limit:,}. {matched_before_filters:,} retrieved publications "
-                f"had at least one author matched to the UK HEI table before your region/HEI filters."
-            )
-        elif truncations:
-            st.warning(
-                f"PubMed found {total_hits:,} matching publications and retrieved {retrieved:,}. "
-                f"{truncations} single-day search window(s) still exceeded PubMed's per-query retrieval ceiling."
-            )
-        else:
-            st.info(
-                f"PubMed found {total_hits:,} matching publications and retrieved {retrieved:,}. "
-                f"{matched_before_filters:,} had at least one UK-HEI-matched author before your geography filters."
-            )
-    elif total_hits and retrieved < total_hits:
+    if total_hits and retrieved < total_hits:
         st.warning(
-            f"OpenAlex reports {total_hits:,} publication hits. "
-            f"This run retrieved {retrieved:,} because of the selected publication limit."
+            f"{database_used} reports {total_hits:,} publication hits. "
+            f"This run retrieved up to {retrieved:,}. Increase the publication limit if you need broader coverage."
         )
 
     unresolved = meta.get("unresolved_journals", [])
@@ -405,12 +362,7 @@ with query_tab:
             "query": meta.get("query"),
             "reported_publication_hits": meta.get("total_publication_hits"),
             "retrieved_publications": meta.get("retrieved_publications"),
-            "publications_with_uk_hei_authors_before_geography_filters": meta.get("publications_with_uk_hei_authors"),
-            "matched_publications_after_geography_filters": detailed_df["Publication ID"].nunique() if not detailed_df.empty else 0,
-            "matched_author_publication_rows_after_geography_filters": len(detailed_df),
-            "requested_publication_limit": meta.get("requested_publication_limit"),
-            "date_windows_searched": meta.get("date_windows_searched"),
-            "complete_retrieval": meta.get("complete_retrieval"),
+            "matched_author_publication_rows": len(detailed_df),
         }
     )
 

@@ -1,6 +1,6 @@
 import re
 import time
-from datetime import date, timedelta
+from datetime import date
 from typing import Iterable
 
 import pandas as pd
@@ -72,144 +72,39 @@ def build_pubmed_journal_clause(journals):
     return "(" + " OR ".join(parts) + ")"
 
 
-def build_pubmed_base_query(search_query, journals):
-    # Build the non-date part once so it can be reused for date chunks.
+def build_pubmed_query(search_query, start_date, end_date, journals):
     clauses = []
-
     if journals:
         clauses.append(build_pubmed_journal_clause(journals))
-
     if search_query.strip():
         clauses.append(f"({search_query.strip()})")
+
+    start_text = pd.Timestamp(start_date).strftime("%Y/%m/%d")
+    end_text = pd.Timestamp(end_date).strftime("%Y/%m/%d")
+    clauses.append(f'("{start_text}"[PDAT] : "{end_text}"[PDAT])')
 
     return " AND ".join(clauses)
 
 
-def build_pubmed_query(search_query, start_date, end_date, journals):
-    base_query = build_pubmed_base_query(search_query, journals)
-    start_text = pd.Timestamp(start_date).strftime("%Y/%m/%d")
-    end_text = pd.Timestamp(end_date).strftime("%Y/%m/%d")
-    date_clause = f'("{start_text}"[PDAT] : "{end_text}"[PDAT])'
-
-    return f"{base_query} AND {date_clause}" if base_query else date_clause
-
-
-def _configure_entrez(api_key=None, email=None):
+def _pubmed_search_ids(query, max_publications, api_key=None, email=None):
     if api_key:
         Entrez.api_key = api_key
-
     if email:
         Entrez.email = email
 
+    count_handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
+    count_record = Entrez.read(count_handle)
+    count_handle.close()
+    total_hits = int(count_record.get("Count", 0))
 
-def _pubmed_count(query, api_key=None, email=None):
-    _configure_entrez(api_key=api_key, email=email)
+    requested = min(total_hits, int(max_publications), 10000)
+    if requested == 0:
+        return [], total_hits
 
-    handle = Entrez.esearch(db="pubmed", term=query, retmax=0)
+    handle = Entrez.esearch(db="pubmed", term=query, retmax=requested, sort="pub date")
     record = Entrez.read(handle)
     handle.close()
-
-    return int(record.get("Count", 0))
-
-
-def _pubmed_ids_for_query(query, requested, api_key=None, email=None):
-    _configure_entrez(api_key=api_key, email=email)
-
-    if requested <= 0:
-        return []
-
-    handle = Entrez.esearch(db="pubmed", term=query, retmax=int(requested), sort="pub date")
-    record = Entrez.read(handle)
-    handle.close()
-
-    return list(record.get("IdList", []))
-
-
-def _collect_pubmed_ids(search_query, start_date, end_date, journals, max_publications=None, api_key=None, email=None):
-    # PubMed ESearch exposes at most the first 10,000 results for one query.
-    # Split large searches into smaller date windows and merge the PMIDs.
-    start_date = pd.Timestamp(start_date).date()
-    end_date = pd.Timestamp(end_date).date()
-
-    full_query = build_pubmed_query(search_query, start_date, end_date, journals)
-    total_hits = _pubmed_count(full_query, api_key=api_key, email=email)
-
-    limit = None if max_publications in (None, 0, "all") else int(max_publications)
-    per_query_limit = 9999
-
-    collected_pmids = []
-    seen_pmids = set()
-    windows_searched = 0
-    single_day_truncations = 0
-
-    def remaining_limit():
-        if limit is None:
-            return None
-        return max(limit - len(collected_pmids), 0)
-
-    def collect_window(window_start, window_end):
-        nonlocal windows_searched, single_day_truncations
-
-        remaining = remaining_limit()
-        if remaining == 0:
-            return
-
-        query = build_pubmed_query(search_query, window_start, window_end, journals)
-        count = _pubmed_count(query, api_key=api_key, email=email)
-        windows_searched += 1
-
-        if count == 0:
-            return
-
-        # Keep splitting until the window is small enough for complete PMID retrieval.
-        if count > per_query_limit and window_start < window_end:
-            midpoint = window_start + (window_end - window_start) // 2
-            collect_window(window_start, midpoint)
-
-            if remaining_limit() != 0:
-                collect_window(midpoint + timedelta(days=1), window_end)
-
-            return
-
-        # A single day with >9,999 hits cannot be split any further by publication date.
-        if count > per_query_limit and window_start == window_end:
-            single_day_truncations += 1
-
-        requested = min(count, per_query_limit)
-        remaining = remaining_limit()
-
-        if remaining is not None:
-            requested = min(requested, remaining)
-
-        pmids = _pubmed_ids_for_query(query, requested, api_key=api_key, email=email)
-
-        for pmid in pmids:
-            if pmid in seen_pmids:
-                continue
-
-            seen_pmids.add(pmid)
-            collected_pmids.append(pmid)
-
-            if limit is not None and len(collected_pmids) >= limit:
-                break
-
-    if total_hits:
-        collect_window(start_date, end_date)
-
-    complete_retrieval = (
-        single_day_truncations == 0
-        and len(collected_pmids) >= total_hits
-    )
-
-    return collected_pmids, {
-        "query": full_query,
-        "total_publication_hits": total_hits,
-        "retrieved_publications": len(collected_pmids),
-        "requested_publication_limit": limit,
-        "date_windows_searched": windows_searched,
-        "single_day_truncations": single_day_truncations,
-        "complete_retrieval": complete_retrieval,
-    }
+    return list(record.get("IdList", [])), total_hits
 
 
 def _get_pubmed_date(article_data):
@@ -330,16 +225,9 @@ def _fetch_pubmed_batch(pmids, api_key=None, email=None):
     return rows
 
 
-def search_pubmed(search_query, start_date, end_date, journals, max_publications=None, api_key=None, email=None):
-    pmids, meta = _collect_pubmed_ids(
-        search_query=search_query,
-        start_date=start_date,
-        end_date=end_date,
-        journals=journals,
-        max_publications=max_publications,
-        api_key=api_key,
-        email=email,
-    )
+def search_pubmed(search_query, start_date, end_date, journals, max_publications=2000, api_key=None, email=None):
+    query = build_pubmed_query(search_query, start_date, end_date, journals)
+    pmids, total_hits = _pubmed_search_ids(query, max_publications, api_key=api_key, email=email)
 
     rows = []
     batch_size = 200
@@ -350,14 +238,12 @@ def search_pubmed(search_query, start_date, end_date, journals, max_publications
         time.sleep(0.11 if api_key else 0.34)
 
     df = pd.DataFrame(rows, columns=STANDARD_COLUMNS)
-
-    # This is different from retrieved_publications:
-    # it counts only fetched papers with at least one author matched to the UK HEI table.
-    meta["publications_with_uk_hei_authors"] = (
-        df["Publication ID"].nunique() if not df.empty else 0
-    )
-    meta["matched_author_publication_rows"] = len(df)
-
+    meta = {
+        "query": query,
+        "total_publication_hits": total_hits,
+        "retrieved_publications": len(set(df["Publication ID"].dropna())) if not df.empty else 0,
+        "matched_author_publication_rows": len(df),
+    }
     return df, meta
 
 

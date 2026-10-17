@@ -17,6 +17,39 @@ A Streamlit app for finding researchers affiliated with UK higher-education inst
 - Regional, HEI and journal coverage summaries.
 - One-hour Streamlit caching for repeated identical searches.
 
+## Restricted NARA member login
+
+The application now requires a single NARA team account to sign in **before** displaying any researcher searches, filters, data tables or downloads. It uses the **same account and initial password as the NARA Funding Opportunity Finder**:
+
+- **Email:** `NARA-CAMHR@hull.ac.uk`
+- **Password:** Use the existing NARA funding finder password provided for this project.
+
+The login page displays this exact notice:
+
+> This funding finder is restricted to authorised NARA member access
+
+The initial password is included only as a salted **PBKDF2-SHA256 hash** in `auth.py`, not as plaintext. Authentication lives in the Streamlit session; a **Log out** button clears the session. Repeated invalid attempts result in a temporary per-session lockout.
+
+For public or shared deployment, **rotate the initial password**, serve over HTTPS, and consider university-managed authentication (SSO / reverse proxy) for higher-assurance membership control. This single-account login is not equivalent to institution-verified multi-user access.
+
+To set a new password, run this once from the project directory after installing dependencies:
+
+```bash
+python3 - <<'PY_HASH'
+from auth import make_password_hash
+from getpass import getpass
+print(make_password_hash(getpass("New password: ")))
+PY_HASH
+```
+
+Copy the output into `.streamlit/secrets.toml` or the Streamlit deployment Secrets area:
+
+```toml
+APP_PASSWORD_HASH = "pbkdf2_sha256$...paste-generated-hash..."
+```
+
+You may also provide `APP_PASSWORD_HASH` as an environment variable. **Never publish `.streamlit/secrets.toml`.**
+
 ## Important identity and affiliation behaviour
 
 The app does **not** use a name-only ORCID search. It reads ORCID directly from PubMed/OpenAlex metadata when it is available.
@@ -31,10 +64,10 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 mkdir -p .streamlit
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-streamlit run streamlit_app.py
+python3 -m streamlit run streamlit_app.py
 ```
 
-Edit `.streamlit/secrets.toml` with your keys.
+Edit `.streamlit/secrets.toml` with your optional database API keys and, if rotating the password, `APP_PASSWORD_HASH`.
 
 ## Secrets
 
@@ -42,6 +75,7 @@ Edit `.streamlit/secrets.toml` with your keys.
 NCBI_API_KEY = "..."
 NCBI_EMAIL = "..."
 OPENALEX_API_KEY = "..."
+APP_PASSWORD_HASH = "pbkdf2_sha256$...optional-new-hash..."
 ```
 
 Do not commit `.streamlit/secrets.toml` to GitHub. It is already included in `.gitignore`.
@@ -77,18 +111,9 @@ If an OpenAlex journal cannot be resolved, the app reports it in the result scre
 
 ## Project files
 
-- `streamlit_app.py` — user interface
+- `streamlit_app.py` — user interface and authenticated application entrypoint
+- `auth.py` — login, salted password verification, logout and session controls
 - `services.py` — PubMed/OpenAlex retrieval, HEI matching and author aggregation
 - `config.py` — journal list, keywords and UK HEI aliases from the notebook
 - `requirements.txt` — deployment dependencies
 - `.streamlit/secrets.toml.example` — secrets template
-
-## PubMed large-result handling
-
-PubMed search reporting now separates:
-
-- **PubMed hits** — total publications matching the query.
-- **Retrieved** — PMIDs actually downloaded for this run.
-- **Matched publications** — retrieved publications with authors that match the selected UK HEI/geography filters.
-
-For PubMed, **All matching publications** is the default retrieval mode. Large searches are automatically split into smaller publication-date windows and the returned PMIDs are merged and deduplicated. This avoids treating UK-HEI-matched publications as though they were the total number retrieved.
